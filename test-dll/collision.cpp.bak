@@ -1,0 +1,245 @@
+#include <windows.h>
+#include <vector>
+#include <cmath>
+#include <cstdio>
+#include <cstdint>
+#include <algorithm>
+
+/**
+ * collision.cpp - Per-Unit Steering Separation (v23)
+ * 
+ * New Approach:
+ * - Hooks CAiSteeringImpl::Update at 0x005D3333.
+ * - Discovery: The engine resets 8 bytes at CUnit+0x44 each tick.
+ * - For horizontal movement, this corresponds to X Force (+0x44) and Z Force (+0x48).
+ * - Writing to +0x4C (Z of Vector3) caused runaway force because it wasn't reset.
+ */
+
+extern "C" void Log(const char* fmt, ...);
+
+struct Vector3 {
+    float x, y, z;
+};
+
+static bool IsProbablyAUnit(uintptr_t entity) {
+    if (entity < 0x00400000 || entity > 0x3FFFFFFF) return false;
+    return true; 
+}
+
+extern "C" void ApplySeparationForUnit(uintptr_t unitA, uintptr_t steering) {
+    struct UnitTrack {
+        uintptr_t addr;
+        float lastDirX;
+        float lastDirZ;
+        int ticksSeen;
+    };
+    static UnitTrack tracked[3] = {};
+    static int trackedCount = 0;
+
+    if (!unitA || !IsProbablyAUnit(unitA)) return;
+
+    static int callCount = 0;
+    int thisCall = ++callCount;
+
+    // Log first unit's state every 2000 calls for ongoing diagnostics
+    if (thisCall % 2000 == 1) {
+        Vector3* pDbg = (Vector3*)(unitA + 0x168); // Position
+        Log("[DIAG #%d] UnitA=%08X pos=(%.1f,%.1f,%.1f)\n",
+            thisCall, (uint32_t)unitA, 
+            pDbg->x, pDbg->y, pDbg->z);
+    }
+
+    if (thisCall % 1000 == 0) {
+        Log("v23: SteeringHook alive. calls=%d\n", thisCall);
+    }
+
+    // Physics constants
+    const float pushStrength    = 0.65f;
+    const float lateralStrength = 0.35f;
+    const float maxTotalPush    = 0.50f;
+
+    Vector3* pPosA = (Vector3*)(unitA + 0x168);
+    float radiusA = 3.0f; 
+
+    {
+        float* pDirX = (float*)(unitA + 0x158);
+        float* pDirZ = (float*)(unitA + 0x160);
+        float curDirX = *pDirX;
+        float curDirZ = *pDirZ;
+
+        // Find or register this unit in tracking
+        int trackIdx = -1;
+        for (int t = 0; t < 3; t++) {
+            if (tracked[t].addr == unitA) { trackIdx = t; break; }
+        }
+        if (trackIdx < 0 && trackedCount < 3) {
+            trackIdx = trackedCount++;
+            tracked[trackIdx].addr = unitA;
+            tracked[trackIdx].lastDirX = curDirX;
+            tracked[trackIdx].lastDirZ = curDirZ;
+            tracked[trackIdx].ticksSeen = 0;
+            Log("[TRACK] Registered unit #%d = 0x%08X\n",
+                trackIdx, (uint32_t)unitA);
+        }
+
+        // If we modified this unit last tick, check if engine reset it
+        if (trackIdx >= 0) {
+            tracked[trackIdx].ticksSeen++;
+            float prevX = tracked[trackIdx].lastDirX;
+            float prevZ = tracked[trackIdx].lastDirZ;
+            float diffX = curDirX - prevX;
+            float diffZ = curDirZ - prevZ;
+            float diffMag = std::sqrt(diffX*diffX + diffZ*diffZ);
+            
+            // Log every 10 ticks for tracked units
+            if (tracked[trackIdx].ticksSeen % 10 == 0) {
+                Log("[TRACK #%d] tick=%d dir=(%.4f,%.4f) "
+                    "prev=(%.4f,%.4f) drift=%.4f\n",
+                    trackIdx, tracked[trackIdx].ticksSeen,
+                    curDirX, curDirZ, prevX, prevZ, diffMag);
+            }
+            
+            tracked[trackIdx].lastDirX = curDirX;
+            tracked[trackIdx].lastDirZ = curDirZ;
+        }
+    }
+
+    Vector3 delta = {0,0,0};
+
+    if (!steering || steering < 0x00400000 || steering > 0x3FFFFFFF) return;
+
+    // steering+0x7C = pointer to results object 
+    uintptr_t results_ptr = *(uintptr_t*)(steering + 0x7C);
+    if (!results_ptr || results_ptr < 0x00400000 || results_ptr > 0x3FFFFFFF) return;
+
+    uintptr_t vec_start = *(uintptr_t*)(results_ptr + 0);
+    uintptr_t vec_end   = *(uintptr_t*)(results_ptr + 4);
+
+    if (!vec_start || !vec_end || vec_start >= vec_end) return;
+    if (vec_start < 0x00400000 || vec_start > 0x3FFFFFFF) return;
+
+    int neighborCount = (int)((vec_end - vec_start) / 28);
+    if (neighborCount <= 0 || neighborCount > 64) return;
+
+    for (int i = 0; i < neighborCount; ++i) {
+        uintptr_t entry = vec_start + i * 28;
+        if (entry < 0x00400000 || entry > 0x3FFFFFFF) continue;
+
+        // Read neighbor position directly from CollisionEntry
+        float nbX = *(float*)(entry + 0x00);
+        float nbZ = *(float*)(entry + 0x08);
+
+        float dx = pPosA->x - nbX;
+        float dz = pPosA->z - nbZ;
+        float distSq = dx*dx + dz*dz;
+
+        // Skip self
+        if (distSq < 0.01f) continue;
+
+        float radiusB = 3.0f;
+        float minDist = radiusA + radiusB;
+
+        if (distSq < minDist * minDist && distSq > 0.001f) {
+            float dist    = std::sqrt(distSq);
+            float overlap = minDist - dist;
+            float nx = dx / dist;
+            float nz = dz / dist;
+            float directPush = (overlap * pushStrength) * 0.5f;
+            float lx = -nz;
+            float lz =  nx;
+            float sidePush = (overlap * lateralStrength) * 0.5f;
+            delta.x += (nx * directPush) + (lx * sidePush);
+            delta.z += (nz * directPush) + (lz * sidePush);
+        }
+    }
+
+    float magSq = delta.x * delta.x + delta.z * delta.z;
+    if (magSq > 0.0001f) {
+        float mag = std::sqrt(magSq);
+        float clampedMag = (mag > maxTotalPush) ? maxTotalPush : mag;
+        float scale = clampedMag / mag;
+        float finalDx = delta.x * scale;
+        float finalDz = delta.z * scale;
+
+        // Only steer moving units - stationary units don't need heading change
+        float unitSpeed = *(float*)(unitA + 0x184);
+        if (unitSpeed < 0.5f || std::isnan(unitSpeed)) return;
+
+        float* pDirX = (float*)(unitA + 0x158);
+        float* pDirZ = (float*)(unitA + 0x160);
+
+        // Safety: only modify if values look like a normalized vector
+        float curX = *pDirX;
+        float curZ = *pDirZ;
+        if (std::isnan(curX) || std::isnan(curZ)) return;
+        if (std::abs(curX) > 2.0f || std::abs(curZ) > 2.0f) return;
+
+        // Add separation force to heading direction
+        // Use small scale factor since this is a normalized vector
+        const float headingScale = 0.03f;
+        // Project separation force perpendicular to current heading
+        // This makes units steer sideways, not reverse direction
+        float perpX = -curZ;  // perpendicular to heading
+        float perpZ =  curX;
+        float perpDot = finalDx * perpX + finalDz * perpZ;
+        // Only apply the perpendicular component (sideways steering)
+        float newX = curX + perpX * perpDot * headingScale;
+        float newZ = curZ + perpZ * perpDot * headingScale;
+
+        // Re-normalize to keep it a unit vector
+        float len = std::sqrt(newX*newX + newZ*newZ);
+        if (len > 0.001f) {
+            *pDirX = newX / len;
+            *pDirZ = newZ / len;
+        }
+
+        if (thisCall % 2000 == 1) {
+            Log("[DIR #%d] UnitA=%08X old=(%.3f,%.3f) "
+                "sep=(%.3f,%.3f) new=(%.3f,%.3f)\n",
+                thisCall, (uint32_t)unitA,
+                curX, curZ, finalDx, finalDz,
+                *pDirX, *pDirZ);
+        }
+    }
+}
+
+static void MakeJmp(uintptr_t addr, void* target) {
+    DWORD old;
+    VirtualProtect((void*)addr, 8, PAGE_EXECUTE_READWRITE, &old);
+    *(uint8_t*)addr        = 0xE9;
+    *(uint32_t*)(addr + 1) = (uintptr_t)target - addr - 5;
+    *(uint8_t*)(addr + 5)  = 0x90;
+    *(uint8_t*)(addr + 6)  = 0x90;
+    *(uint8_t*)(addr + 7)  = 0x90;
+    VirtualProtect((void*)addr, 8, old, &old);
+}
+
+extern "C" __attribute__((naked)) void Hook_SteeringUpdate() {
+    asm (
+        ".intel_syntax noprefix\n"
+        "push esi\n"               
+        "push ebx\n"               
+        "mov eax, [ebx + 0x1C]\n"  
+        "push eax\n"               
+        "call _ApplySeparationForUnit\n"
+        "add esp, 8\n"
+        "pop esi\n"                
+        "mov eax, [ebx + 0x7C]\n"
+        "test eax, eax\n"
+        "xorps xmm0, xmm0\n"
+        "push 0x005D333B\n"
+        "ret\n"
+        ".att_syntax\n"
+    );
+}
+
+extern "C" void InstallSteeringHook() {
+    Log("Applying Separation Hook v23 (Per-Unit Steering)...\n");
+    
+    // Force-enable AI_DebugCollision flag
+    *(uint8_t*)0x010A6395 = 1;
+    Log("AI_DebugCollision flag enabled.\n");
+
+    MakeJmp(0x005D3333, (void*)Hook_SteeringUpdate);
+    Log("Hook active at 0x005D3333.\n");
+}

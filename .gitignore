@@ -18,3 +18,7 @@ section.cpp
 section.ld
 section/main.cpp
 section/main.cxx
+
+test-dll/video
+test-dll/GeometricTools
+test-dll/ida
