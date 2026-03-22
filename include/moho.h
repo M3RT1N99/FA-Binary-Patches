@@ -105,7 +105,7 @@ struct moho_set
 };
 VALIDATE_SIZE(moho_set, 0x20)
 
-typedef int SOCKET;
+// typedef int SOCKET; // Conflicts with winsock/windows.h
 // GPGCore
 
 struct Vector2f
