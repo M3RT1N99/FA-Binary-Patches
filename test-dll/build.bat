@@ -39,7 +39,7 @@ echo [*] Building FATestDll.dll...
     -DBUILDING_FA_TEST_DLL ^
     -shared ^
     -o FATestDll.dll ^
-    dllmain.cpp collision.cpp ^
+    dllmain.cpp collision.cpp steering.cpp ^
     -lkernel32 -luser32 -lpsapi
 
 if errorlevel 1 (

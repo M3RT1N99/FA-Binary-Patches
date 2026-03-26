@@ -1,103 +1,267 @@
+// ==========================================================================
+// steering.cpp - Steering-Layer Separation Force Hook
+//
+// Hooks CAiSteeringImpl::CheckCollisions (0x5d3740) to add a separation
+// force to CUnitMotion::mForce AFTER the engine collision detection.
+// Units dodge each other.
+//
+// Pipeline: A* path -> Steering waypoints -> CheckCollisions -> *HOOK* -> Physics
+//
+// Hotkey: Shift+8 Toggle
+// ==========================================================================
 #include <windows.h>
-#include <cstdio>
 #include <cstdint>
 #include <cmath>
-#include "../include/engine.h"
+#include <cstring>
 
-extern void Log(const char* fmt, ...);
+extern "C" void Log(const char* fmt, ...);
 
-// Original function pointer (trampoline)
-void* Trampoline_CalculateForces = nullptr;
+// Extern: NbrCache from collision.cpp
+struct NbrEntry { float x, z; uint32_t addr; float size; };
+extern NbrEntry g_NbrCache[];
+extern volatile LONG g_NbrIdx;
 
-// We will implement our custom steering logic here
-extern "C" int Hook_CalculateForces_C(void* entity1, void* entity2) {
-    // 1. Call the original Collision Math
-    int result = 0;
-    void* tramp = Trampoline_CalculateForces;
-    
-    // Call the trampoline passing entity1 in EAX and entity2 on the stack
-    asm volatile (
-        "mov %1, %%eax\n"
-        "push %2\n"            // Push param_1 to stack
-        "call *%3\n"
-        "add $4, %%esp\n"      // Clean up pushed parameter
-        "mov %%eax, %0\n"
-        : "=r" (result)
-        : "r" (entity1), "r" (entity2), "r" (tramp)
-        : "eax", "ecx", "edx", "memory"
-    );
+// Feature Flag
+static bool g_SepEnabled = true;
 
-    // 2. Here we would add custom RVO / Separation vectors.
-    static int logCount = 0;
-    if (logCount < 50) {
-        Log("[SteeringHook] ResolvePossibleCollision: Entity1=%08X Entity2=%08X\n", (uint32_t)entity1, (uint32_t)entity2);
-        logCount++;
+// Parameters
+#define SEP_STRENGTH      1.0f    // Waypoint offset per neighbor (in world units)
+#define SEP_RANGE_MULT    2.5f    // Scan radius = (mySize + nbrSize) * MULT
+#define SEP_MAX_OFFSET    3.0f    // Max waypoint displacement (world units)
+#define SEP_UNDO_SLOTS    512     // Undo entries for destination rollback
+#define SEP_VTABLE_MIN    0x00900000
+#define SEP_VTABLE_MAX    0x01200000
+
+// Debug
+static LONG g_sepDbgCalls = 0;
+static LONG g_sepDbgForced = 0;
+static float g_sepDbgMaxForce = 0.0f;
+static LONG g_sepOffsetDbg = 0;
+
+// Undo map: stores last offset per steering instance
+// so we can reset destination before applying new offset
+struct UndoEntry { uint32_t steeringAddr; float lastOffX, lastOffZ; };
+static UndoEntry g_UndoMap[SEP_UNDO_SLOTS];
+
+static UndoEntry* findUndo(uint32_t addr) {
+    int idx = (addr >> 4) % SEP_UNDO_SLOTS;
+    for (int i = 0; i < 8; i++) {
+        int slot = (idx + i) % SEP_UNDO_SLOTS;
+        if (g_UndoMap[slot].steeringAddr == addr)
+            return &g_UndoMap[slot];
+        if (g_UndoMap[slot].steeringAddr == 0) {
+            g_UndoMap[slot].steeringAddr = addr;
+            g_UndoMap[slot].lastOffX = 0;
+            g_UndoMap[slot].lastOffZ = 0;
+            return &g_UndoMap[slot];
+        }
+    }
+    return nullptr;
+}
+
+// Read blueprint size (same function as collision.cpp)
+static float GetUnitSize(uint32_t unit) {
+    uint32_t vtable = *(uint32_t*)unit;
+    if (vtable < SEP_VTABLE_MIN || vtable > SEP_VTABLE_MAX) return 1.0f;
+    typedef uint32_t (__thiscall *GetBP_fn)(uint32_t);
+    GetBP_fn getBP = (GetBP_fn)(*(uint32_t*)(vtable + 0x1C));
+    if (!getBP) return 1.0f;
+    uint32_t bp = getBP(unit);
+    if (!bp) return 1.0f;
+    float sx = *(float*)(bp + 0xAC);
+    float sz = *(float*)(bp + 0xB4);
+    return (sz > sx) ? sz : sx;
+}
+
+// ==========================================================================
+// ApplySeparation - Core function
+//
+// Reads NbrCache, computes separation vector, nudges mVelocity.
+// Velocity is recalculated next frame by steering - no permanent
+// state corruption, no accumulation.
+//
+// Called AFTER CheckCollisions with the CAiSteeringImpl* this pointer.
+// ==========================================================================
+static void __cdecl ApplySeparation(uint32_t steeringPtr) {
+    g_sepDbgCalls++;
+    if (!g_SepEnabled) return;
+
+    // Unit pointer: Steering+0x20 (from IDA: [edi+20h])
+    uint32_t unit = *(uint32_t*)(steeringPtr + 0x20);
+    if (!unit) return;
+    uint32_t vtable = *(uint32_t*)unit;
+    if (vtable < SEP_VTABLE_MIN || vtable > SEP_VTABLE_MAX) return;
+
+    float myX = *(float*)(unit + 0x160);
+    float myZ = *(float*)(unit + 0x168);
+    float mySize = GetUnitSize(unit);
+
+    // Compute separation vector (away from neighbors)
+    float pushX = 0.0f, pushZ = 0.0f;
+    int nbrHits = 0;
+
+    LONG nbrCount = g_NbrIdx;
+    if (nbrCount > 512) nbrCount = 512;
+
+    for (LONG i = 0; i < nbrCount; i++) {
+        if (g_NbrCache[i].addr == unit) continue;
+
+        float dx = myX - g_NbrCache[i].x;
+        float dz = myZ - g_NbrCache[i].z;
+        float distSq = dx * dx + dz * dz;
+        float minDist = (mySize + g_NbrCache[i].size) * SEP_RANGE_MULT;
+
+        if (distSq < minDist * minDist && distSq > 0.01f) {
+            float dist = sqrtf(distSq);
+            float penetration = 1.0f - dist / minDist;
+            float force = SEP_STRENGTH * penetration;
+            pushX += (dx / dist) * force;
+            pushZ += (dz / dist) * force;
+            nbrHits++;
+        }
     }
 
-    // Example logic ready for integration:
-    // CBlueprint* bp = unit->GetBlueprint();
-    // float maxForce = bp->Physics.MaxSteerForce;
-    // Iterate Sim->units, find nearby, calculate vector away from them, add to steering accel.
+    if (nbrHits == 0) return;
 
-    return result;
-}
-
-// Naked wrapper to capture EAX and stack argument
-__attribute__((naked)) void Hook_CalculateForces_Naked() {
-    asm volatile (
-        "push 4(%esp)\n"         // Push param_1 (arg2)
-        "push %eax\n"            // Push EAX (arg1)
-        "call _Hook_CalculateForces_C\n"
-        "add $8, %esp\n"         // Clean up our pushed C arguments
-        "ret\n"
-    );
-}
-
-// Memory patching utility
-void PatchJmp(uint32_t targetAddr, uint32_t hookAddr, int bytesToNop = 0) {
-    DWORD oldProtect;
-    VirtualProtect((void*)targetAddr, 5 + bytesToNop, PAGE_EXECUTE_READWRITE, &oldProtect);
-    
-    uint8_t* pTarget = (uint8_t*)targetAddr;
-    pTarget[0] = 0xE9; // JMP
-    *(uint32_t*)(pTarget + 1) = hookAddr - targetAddr - 5;
-    
-    for (int i = 0; i < bytesToNop; i++) {
-        pTarget[5 + i] = 0x90; // NOP
+    // Clamp offset
+    float pushMag = sqrtf(pushX * pushX + pushZ * pushZ);
+    if (pushMag > SEP_MAX_OFFSET) {
+        float scale = SEP_MAX_OFFSET / pushMag;
+        pushX *= scale;
+        pushZ *= scale;
+        pushMag = SEP_MAX_OFFSET;
     }
-    
-    VirtualProtect((void*)targetAddr, 5 + bytesToNop, oldProtect, &oldProtect);
+
+    // Nudge velocity: CUnitMotion+0x38 = mVelocity (Vector3f)
+    // Small lateral push per frame. Next frame steering recalculates
+    // velocity completely - no accumulation, no state corruption.
+    uint32_t motion = *(uint32_t*)(steeringPtr + 0x60);
+    if (!motion) return;
+
+    float* velX = (float*)(motion + 0x38);
+    float* velZ = (float*)(motion + 0x40); // +0x38=x, +0x3C=y, +0x40=z
+
+    *velX += pushX;
+    *velZ += pushZ;
+
+    // Debug
+    if (pushMag > g_sepDbgMaxForce) g_sepDbgMaxForce = pushMag;
+    g_sepDbgForced++;
+
+    if (g_sepOffsetDbg < 5) {
+        Log("[SEP] unit=0x%08X nbrs=%d push=(%.2f,%.2f)\n",
+            unit, nbrHits, pushX, pushZ);
+        g_sepOffsetDbg++;
+    }
 }
 
-// Install the detour
-void InstallSteeringHook() {
-    uint32_t targetAddr = 0x00596F30; // ResolvePossibleCollision
-    
-    // The first 5 bytes of 0x00596F30 are:
-    // 83 EC 60    SUB ESP, 0x60
-    // 53          PUSH EBX
-    // 55          PUSH EBP
-    uint8_t origBytes[5] = { 0x83, 0xEC, 0x60, 0x53, 0x55 };
-    
-    // Verify bytes match to avoid crashing
-    if (memcmp((void*)targetAddr, origBytes, 5) != 0) {
-        Log("[SteeringHook] ERROR: Signature mismatch at 0x00596F30. Hook aborted.\n");
+// ==========================================================================
+// Hook Installation: Detour on CheckCollisions (0x5d3740)
+//
+// Original Prologue (6 bytes):
+//   55          push ebp
+//   8B EC       mov ebp, esp
+//   83 E4 F8    and esp, -8
+//
+// Calling Convention: __stdcall (retn 4), Parameter: this on stack
+//
+// Our detour:
+//   1. Saves this pointer
+//   2. Calls original CheckCollisions via trampoline
+//   3. Calls ApplySeparation(this)
+//   4. Returns via retn 4
+// ==========================================================================
+static uint8_t* g_SteerTrampoline = nullptr;  // Original prologue + JMP back
+static uint8_t* g_SteerDetour = nullptr;       // Our wrapper
+
+static const uint8_t ORIG_PROLOGUE[] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8};
+
+void InstallSeparationHook() {
+    uint8_t* hookSite = (uint8_t*)0x005D3740;
+
+    // Verify original bytes
+    if (memcmp(hookSite, ORIG_PROLOGUE, 6) != 0) {
+        Log("[SEP] FAILED: bytes at 0x5D3740 don't match expected prologue\n");
+        Log("[SEP] Got: %02X %02X %02X %02X %02X %02X\n",
+            hookSite[0], hookSite[1], hookSite[2],
+            hookSite[3], hookSite[4], hookSite[5]);
         return;
     }
 
-    // Allocate 10 bytes for trampoline (5 original bytes + 5 byte JMP)
-    Trampoline_CalculateForces = VirtualAlloc(NULL, 10, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    
-    // Copy original bytes
-    memcpy(Trampoline_CalculateForces, origBytes, 5);
-    
-    // Write JMP back to original function + 5
-    uint8_t* tramp = (uint8_t*)Trampoline_CalculateForces;
-    tramp[5] = 0xE9; // JMP
-    *(uint32_t*)(tramp + 6) = (targetAddr + 5) - (uint32_t)(tramp + 5) - 5;
+    // --- Trampoline: Original prologue + JMP back ---
+    g_SteerTrampoline = (uint8_t*)VirtualAlloc(NULL, 4096,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!g_SteerTrampoline) { Log("[SEP] VirtualAlloc trampoline FAILED\n"); return; }
 
-    // Apply the detour jump
-    PatchJmp(targetAddr, (uint32_t)&Hook_CalculateForces_Naked, 0); // 0 byte NOP needed
-    
-    Log("[SteeringHook] Successfully detoured ResolvePossibleCollision!\n");
+    int off = 0;
+    // Original 6 bytes
+    memcpy(g_SteerTrampoline + off, ORIG_PROLOGUE, 6); off += 6;
+    // JMP to original function + 6 (0x5d3746)
+    g_SteerTrampoline[off++] = 0xE9;
+    int32_t relBack = (int32_t)(0x005D3746 - (uint32_t)(g_SteerTrampoline + off + 4));
+    memcpy(g_SteerTrampoline + off, &relBack, 4); off += 4;
+
+    // --- Detour: Wrapper that calls original, then our function ---
+    g_SteerDetour = (uint8_t*)VirtualAlloc(NULL, 4096,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!g_SteerDetour) { Log("[SEP] VirtualAlloc detour FAILED\n"); return; }
+
+    off = 0;
+    // Detour is stdcall: [esp+4] = this
+    //
+    // mov eax, [esp+4]       ; eax = this
+    g_SteerDetour[off++] = 0x8B; g_SteerDetour[off++] = 0x44;
+    g_SteerDetour[off++] = 0x24; g_SteerDetour[off++] = 0x04;
+    // push eax               ; save this (for later)
+    g_SteerDetour[off++] = 0x50;
+    // push eax               ; arg for original CheckCollisions (stdcall)
+    g_SteerDetour[off++] = 0x50;
+    // call g_SteerTrampoline ; original CheckCollisions (stdcall, pops arg)
+    g_SteerDetour[off++] = 0xE8;
+    int32_t relTramp = (int32_t)((uint32_t)g_SteerTrampoline - (uint32_t)(g_SteerDetour + off + 4));
+    memcpy(g_SteerDetour + off, &relTramp, 4); off += 4;
+    // pop eax                ; restore saved this
+    g_SteerDetour[off++] = 0x58;
+    // push eax               ; arg for ApplySeparation (cdecl)
+    g_SteerDetour[off++] = 0x50;
+    // call ApplySeparation
+    g_SteerDetour[off++] = 0xE8;
+    int32_t relSep = (int32_t)((uint32_t)&ApplySeparation - (uint32_t)(g_SteerDetour + off + 4));
+    memcpy(g_SteerDetour + off, &relSep, 4); off += 4;
+    // add esp, 4             ; cdecl cleanup
+    g_SteerDetour[off++] = 0x83; g_SteerDetour[off++] = 0xC4; g_SteerDetour[off++] = 0x04;
+    // retn 4                 ; stdcall return (pops original this arg from caller)
+    g_SteerDetour[off++] = 0xC2; g_SteerDetour[off++] = 0x04; g_SteerDetour[off++] = 0x00;
+
+    // --- Patch: JMP from CheckCollisions to our detour ---
+    DWORD old;
+    if (VirtualProtect(hookSite, 6, PAGE_EXECUTE_READWRITE, &old)) {
+        // JMP rel32 (5 bytes) + NOP (1 byte)
+        hookSite[0] = 0xE9;
+        int32_t relJmp = (int32_t)((uint32_t)g_SteerDetour - (0x005D3740 + 5));
+        memcpy(hookSite + 1, &relJmp, 4);
+        hookSite[5] = 0x90; // NOP for 6th byte
+        VirtualProtect(hookSite, 6, old, &old);
+        Log("[SEP] Hook OK at 0x5D3740 -> detour 0x%08X -> tramp 0x%08X\n",
+            (uint32_t)g_SteerDetour, (uint32_t)g_SteerTrampoline);
+    } else {
+        Log("[SEP] VirtualProtect FAILED\n");
+    }
+}
+
+// Debug log (called from collision.cpp HotkeyThread)
+void SeparationDebugLog() {
+    Log("[SEP] calls=%d forced=%d maxF=%.2f enabled=%s\n",
+        g_sepDbgCalls, g_sepDbgForced, g_sepDbgMaxForce,
+        g_SepEnabled ? "ON" : "OFF");
+    g_sepDbgCalls = 0;
+    g_sepDbgForced = 0;
+    g_sepDbgMaxForce = 0.0f;
+    g_sepOffsetDbg = 0;
+}
+
+// Toggle (Shift+8)
+void SeparationToggle() {
+    g_SepEnabled = !g_SepEnabled;
+    Log("[HOTKEY] Separation = %s\n", g_SepEnabled ? "ON" : "OFF");
 }

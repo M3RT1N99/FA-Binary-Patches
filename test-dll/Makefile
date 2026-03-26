@@ -13,12 +13,12 @@ all: FATestDll.dll Injector.exe
 # -----------------------------------------------------------------------
 # The test DLL (32-bit, injected into ForgedAlliance.exe)
 # -----------------------------------------------------------------------
-FATestDll.dll: dllmain.cpp collision.cpp ../include/engine.h ../include/global.h ../include/moho.h
+FATestDll.dll: dllmain.cpp collision.cpp steering.cpp ../include/engine.h ../include/global.h ../include/moho.h
 	$(CXX) $(CXXFLAGS) \
 	    -DBUILDING_FA_TEST_DLL \
 	    -shared \
 	    -o $@ \
-	    dllmain.cpp collision.cpp \
+	    dllmain.cpp collision.cpp steering.cpp \
 	    -lkernel32 -luser32 -lpsapi
 	@echo "[OK] Built FATestDll.dll"
 
