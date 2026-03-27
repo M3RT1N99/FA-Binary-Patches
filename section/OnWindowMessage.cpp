@@ -56,6 +56,16 @@ int __thiscall OnWindowMessage(void *this_, unsigned int uMsg, unsigned int wPar
             .transitionState = 1}
                      .ToULong();
         break;
+    case 0x0100: /*WM_KEYDOWN*/
+    {
+        // GetKeyState is __stdcall via IAT thunk
+        short (__stdcall *GetKeyState)(int) = (short(__stdcall*)(int))0xA81922;
+        bool shiftHeld = GetKeyState(0x10) < 0; // VK_SHIFT
+        if (shiftHeld) {
+            DebugMovement_OnKeyDown(wParam, true);
+        }
+        // fall through to default — don't consume the keypress
+    }
     default:
         break;
     }
