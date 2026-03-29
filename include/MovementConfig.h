@@ -14,6 +14,14 @@
 #define OFF_UNIT_NAVIGATOR      0x54C   // verified from NewMoveTask disasm (NOT 0x4B4)
 #define OFF_SIM_CURTICK         0x900
 
+// CAiPathNavigator member offsets (IDA-verified)
+#define OFF_PATHNAV_CURRENTPOS  0x24  // mCurrentPos (HPathCell, packed int16: x low, z high)
+#define OFF_PATHNAV_GOAL_X      0x30  // mGoal.mPos1.x0 (set by SetGoal)
+#define OFF_PATHNAV_GOAL_Z      0x34  // mGoal.mPos1.z0
+#define OFF_PATHNAV_TAG_X       0x40  // mGoal.mPos2.x0 — build center X tag
+#define OFF_PATHNAV_TAG_Z       0x44  // mGoal.mPos2.z0 — build center Z tag
+#define OFF_PATHNAV_TAG_RANGE   0x48  // mGoal.mPos2.x1 — rangeCells tag (0=inactive)
+
 // Blueprint economy
 #define OFF_BP_MAXBUILDDIST     0x564   // float MaxBuildDistance
 
