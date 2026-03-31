@@ -59,5 +59,12 @@ int __thiscall OnWindowMessage(void *this_, unsigned int uMsg, unsigned int wPar
     default:
         break;
     }
+    // Debug hotkeys (Shift + number key)
+    if (uMsg == 0x0100 /*WM_KEYDOWN*/) {
+        if (IsShiftHeld()) {
+            DebugKeyDown(wParam);
+        }
+    }
+
     return wxWindow__MSWWindowProc(this_, uMsg, wParam, lParam);
 }
