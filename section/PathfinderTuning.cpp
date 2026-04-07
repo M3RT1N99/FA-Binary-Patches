@@ -29,6 +29,8 @@
 #include "magic_classes.h"
 #include "moho.h"
 #include "global.h"
+#include "MovementConfig.h"
+#include "PathfinderOccupancy.h"
 #include <stdint.h>
 
 // CAiPathFinder offsets (faf-re reverse engineering, IDA verified)
@@ -36,13 +38,15 @@
 #define OFF_PF_GOAL_Z0  0x40
 #define OFF_PF_GOAL_X1  0x44
 #define OFF_PF_GOAL_Z1  0x48
+#define OFF_PF_SIM      0x28    // CAiPathFinder + 0x28 → Sim*
 
 // --------------------------------------------------------------------------
 // Tunable globals. Defaults are chosen to be a clear improvement over
 // vanilla without producing visibly worse paths.
 // --------------------------------------------------------------------------
-float pathHeuristicWeight = 1.10f;
-float pathHeuristicSpread = 0.50f;
+float pathHeuristicWeight   = 1.10f;
+float pathHeuristicSpread   = 0.50f;
+float pathOccupancyPenalty  = 0.75f;   // cost added per occupying unit in candidate cell's bucket
 
 int SetPathHeuristicWeight(lua_State* L)
 {
@@ -66,6 +70,18 @@ int SetPathHeuristicSpread(lua_State* L)
 }
 SimRegFunc SetPathHeuristicSpreadReg{
     "SetPathHeuristicSpread", "(float s=0.50) per-unit A* hash spread", SetPathHeuristicSpread
+};
+
+int SetPathOccupancyPenalty(lua_State* L)
+{
+    float p = (float)luaL_optnumber(L, 1, 0.75);
+    if (p < 0.0f) p = 0.0f;
+    if (p > 4.0f) p = 4.0f;
+    pathOccupancyPenalty = p;
+    return 0;
+}
+SimRegFunc SetPathOccupancyPenaltyReg{
+    "SetPathOccupancyPenalty", "(float p=0.75) cost per moving unit in cell bucket", SetPathOccupancyPenalty
 };
 
 // --------------------------------------------------------------------------
@@ -146,6 +162,30 @@ extern "C" void __cdecl ComputeHeuristicC(void* pathfinder, void* cellPtr, float
         h ^= (h >> 16);
         float noise = (float)(h & 0xFF) * (1.0f / 255.0f);  // [0,1)
         result += noise * pathHeuristicSpread;
+    }
+
+    // Per-tick occupancy penalty: if the candidate cell falls into a
+    // bucket that is currently crowded with moving units, add cost so
+    // A* prefers a path around the cluster. Determinism: bucket key is
+    // pure cell coords; sim tick comes from the engine state.
+    if (pathOccupancyPenalty > 0.0f) {
+        void* sim = *reinterpret_cast<void**>(pf + OFF_PF_SIM);
+        if (sim) {
+            uint32_t curTick = *reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(sim) + OFF_SIM_CURTICK);
+            int bcx = cx / OCC_BUCKET_SIZE;
+            int bcz = cz / OCC_BUCKET_SIZE;
+            uint32_t bucket = PathOcc_HashCell(bcx, bcz);
+            uint32_t v = gPathOccupancyHash[bucket];
+            if ((v >> 8) == curTick) {
+                uint32_t count = v & 0xFFu;
+                // Subtract 1: the unit doing the search is itself in the
+                // bucket; we only want to penalize OTHERS being there.
+                if (count > 1) {
+                    result += (float)(count - 1) * pathOccupancyPenalty;
+                }
+            }
+        }
     }
 
     *outResult = result;
