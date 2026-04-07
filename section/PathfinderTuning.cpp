@@ -46,7 +46,20 @@
 // --------------------------------------------------------------------------
 float pathHeuristicWeight   = 1.10f;
 float pathHeuristicSpread   = 0.50f;
-float pathOccupancyPenalty  = 0.75f;   // cost added per occupying unit in candidate cell's bucket
+// Cost added per OTHER moving unit in candidate cell's bucket. The cap
+// is the critical fix: without it, dense clusters (max observed 30+ units)
+// produced prohibitive per-cell costs that sent engineers on huge detours.
+// With cap=8 the worst case is bounded at (8-1)*p per cell, so even
+// dense crowds can't deflect units beyond reason.
+//
+// At 0.25 with cap=8:
+//   crowd of 4 over 5 cells = 5 * 3 * 0.25 = 3.75   (direct wins vs 5-cell detour)
+//   crowd of 8 over 5 cells = 5 * 7 * 0.25 = 8.75   (mild detour preference)
+//   crowd of 30 (capped 8)  = 5 * 7 * 0.25 = 8.75   (same as 8 — bounded)
+//
+// Tunable via SetPathOccupancyPenalty(p) at runtime.
+float pathOccupancyPenalty  = 0.25f;
+#define OCC_COUNT_CAP   8u
 
 int SetPathHeuristicWeight(lua_State* L)
 {
@@ -113,12 +126,35 @@ SimRegFunc SetPathRectHistoryDepthReg{
 };
 
 // --------------------------------------------------------------------------
-// Heuristic replacement (called from asm thunk below).
+// Auto-tuning telemetry (TEMPORARY — removed in cleanup commit).
 //
-// pathfinder = `this` of CAiPathFinder (ecx in __thiscall)
-// cellPtr    = SOCellPos* (uint16 x, uint16 z) — A* candidate cell
-// outResult  = single-precision result, written by callee
+// Each ComputeHeuristicC call optionally records:
+//   - sum of base heuristic
+//   - sum of occupancy penalty added
+//   - histogram of bucket counts encountered
+//   - hits/calls ratio
+//
+// Periodically we log the aggregates AND a recommended pathOccupancyPenalty
+// value computed as:
+//   ideal = current * (TARGET_RATIO / observed_ratio)
+// where TARGET_RATIO is the desired penalty/base ratio (10–15%).
 // --------------------------------------------------------------------------
+struct HeurStats {
+    uint64_t calls;
+    uint64_t baseSum_x1000;       // base * 1000 to keep precision in int
+    uint64_t penaltySum_x1000;    // penalty * 1000
+    uint64_t hits;                // calls where bucket count > 1
+    uint64_t bucketCountHist[8];  // index 0=0/1 units, 1=2, 2=3, ... 7=8+
+    uint64_t lastLogCall;
+};
+static HeurStats gHeurStats = {};
+static const uint64_t kHeurLogInterval = 500000;   // ~every 500k calls
+
+// Tuning target: per-HIT penalty should be ~1.5 cells of base cost. Hits
+// are only ~18% of cells, so global ratio is much smaller. We tune to make
+// the penalty meaningful WHEN it triggers, not on average over all calls.
+static const float    kTargetPenaltyPerHit = 1.5f;
+
 extern "C" void __cdecl ComputeHeuristicC(void* pathfinder, void* cellPtr, float* outResult)
 {
     auto* pf = reinterpret_cast<uint8_t*>(pathfinder);
@@ -168,6 +204,8 @@ extern "C" void __cdecl ComputeHeuristicC(void* pathfinder, void* cellPtr, float
     // bucket that is currently crowded with moving units, add cost so
     // A* prefers a path around the cluster. Determinism: bucket key is
     // pure cell coords; sim tick comes from the engine state.
+    float penaltyAdded = 0.0f;
+    uint32_t observedCount = 0;
     if (pathOccupancyPenalty > 0.0f) {
         void* sim = *reinterpret_cast<void**>(pf + OFF_PF_SIM);
         if (sim) {
@@ -178,13 +216,68 @@ extern "C" void __cdecl ComputeHeuristicC(void* pathfinder, void* cellPtr, float
             uint32_t bucket = PathOcc_HashCell(bcx, bcz);
             uint32_t v = gPathOccupancyHash[bucket];
             if ((v >> 8) == curTick) {
-                uint32_t count = v & 0xFFu;
+                observedCount = v & 0xFFu;
                 // Subtract 1: the unit doing the search is itself in the
                 // bucket; we only want to penalize OTHERS being there.
-                if (count > 1) {
-                    result += (float)(count - 1) * pathOccupancyPenalty;
+                // Cap the effective count so single mega-clusters don't
+                // produce prohibitively expensive crossings.
+                uint32_t effective = observedCount;
+                if (effective > OCC_COUNT_CAP) effective = OCC_COUNT_CAP;
+                if (effective > 1) {
+                    penaltyAdded = (float)(effective - 1) * pathOccupancyPenalty;
+                    result += penaltyAdded;
                 }
             }
+        }
+    }
+
+    // ---- Telemetry recording (remove in cleanup) ------------------------
+    {
+        ++gHeurStats.calls;
+        gHeurStats.baseSum_x1000    += (uint64_t)((minor * 0.41421354f + major) * 1000.0f);
+        gHeurStats.penaltySum_x1000 += (uint64_t)(penaltyAdded * 1000.0f);
+        if (observedCount > 1) ++gHeurStats.hits;
+        uint32_t bucketBin = (observedCount <= 1) ? 0u
+                            : (observedCount >= 8 ? 7u : (observedCount - 1));
+        ++gHeurStats.bucketCountHist[bucketBin];
+
+        if (gHeurStats.calls - gHeurStats.lastLogCall >= kHeurLogInterval) {
+            gHeurStats.lastLogCall = gHeurStats.calls;
+
+            // Compute averages. All divisions through float to avoid
+            // libgcc's __udivdi3 (we build with -nostdlib).
+            float fcalls    = (float)gHeurStats.calls;
+            float fhits     = (float)gHeurStats.hits;
+            float baseAvg   = (float)gHeurStats.baseSum_x1000    / fcalls / 1000.0f;
+            float penAvg    = (float)gHeurStats.penaltySum_x1000 / fcalls / 1000.0f;
+
+            // Recommended penalty: target ~1.5 cells of cost PER HIT (not
+            // averaged over all calls). When a cell is in a fresh bucket
+            // we want the cost bump to be meaningful — comparable to
+            // taking a 1-2 cell detour — but not crushing.
+            float penPerHit = (fhits > 0.0f)
+                            ? ((float)gHeurStats.penaltySum_x1000 / fhits / 1000.0f)
+                            : 0.0f;
+            float recommended = pathOccupancyPenalty;
+            if (penPerHit > 0.0001f) {
+                recommended = pathOccupancyPenalty * (kTargetPenaltyPerHit / penPerHit);
+                if (recommended < 0.05f) recommended = 0.05f;
+                if (recommended > 1.5f)  recommended = 1.5f;
+            }
+            float hitPct = fhits / fcalls * 100.0f;
+
+            LogF("PathTune: calls=%u  hit_rate=%.1f%%  base_avg=%.2f  pen_per_hit=%.2f  current=%.3f  recommend=%.3f",
+                 (uint32_t)gHeurStats.calls, hitPct, baseAvg, penPerHit,
+                 pathOccupancyPenalty, recommended);
+            LogF("PathTune: bucket_hist  c<=1:%u  c=2:%u  c=3:%u  c=4:%u  c=5:%u  c=6:%u  c=7:%u  c>=8:%u",
+                 (uint32_t)gHeurStats.bucketCountHist[0],
+                 (uint32_t)gHeurStats.bucketCountHist[1],
+                 (uint32_t)gHeurStats.bucketCountHist[2],
+                 (uint32_t)gHeurStats.bucketCountHist[3],
+                 (uint32_t)gHeurStats.bucketCountHist[4],
+                 (uint32_t)gHeurStats.bucketCountHist[5],
+                 (uint32_t)gHeurStats.bucketCountHist[6],
+                 (uint32_t)gHeurStats.bucketCountHist[7]);
         }
     }
 
