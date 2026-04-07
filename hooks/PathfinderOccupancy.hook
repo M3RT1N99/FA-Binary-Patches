@@ -1,9 +1,19 @@
 // PathfinderOccupancy.hook
-// Hook into Moho::CAiSteeringImpl::TaskTick (0x5D32B0).
-// Overwrites the 6-byte prolog (55 8B EC 83 E4 F8 = push ebp / mov ebp,esp /
-// and esp,F8) with a JMP to our observer thunk. The thunk preserves all
-// registers, calls our C handler, then re-executes the overwritten prolog
-// instructions and jumps back to 0x5D32B6 (sub esp, 58h).
+//
+// Hook 1: Moho::CAiSteeringImpl::TaskTick (0x5D32B0).
+// Overwrites 6-byte prolog (55 8B EC 83 E4 F8 = push ebp / mov ebp,esp /
+// and esp,F8) with a JMP to our observer thunk. Updates the per-tick
+// occupancy hash with the unit's position.
 0x005D32B0:
     jmp @OnTickObserveHook
+    nop
+
+// Hook 2: Moho::CAiPathFinder::OnPathAccepted (0x5AA9A0).
+// Overwrites 8-byte prolog (56 33 C0 57 8B 7C 24 0C = push esi / xor eax,eax
+// / push edi / mov edi,[esp+0Ch]) with JMP+3xNOP. Updates the path
+// reservation hash for cooperative pathfinding.
+0x005AA9A0:
+    jmp @OnPathAcceptedHook
+    nop
+    nop
     nop

@@ -18,6 +18,21 @@
 
 extern uint32_t gPathOccupancyHash[OCC_HASH_SIZE];
 
+// Path reservation hash — distinct from occupancy. Updated when a unit's
+// pathfind is accepted (CAiPathFinder::OnPathAccepted hook). Each cell on
+// the accepted path bumps a bucket count tagged with an expiration tick
+// (current tick + OCC_RESERVATION_LIFETIME). Subsequent A* searches see
+// these reservations and add penalty, so units pathing toward the same
+// area after another unit just claimed a route diverge naturally.
+//
+// Bucket pack: (expirationTick << 8) | count, count saturates at 255.
+//
+// This is "Cooperative A*" / Silver 2005 reservation, simplified: no
+// per-cell timing — all cells in a path get the same expiration.
+extern uint32_t gPathReservationHash[OCC_HASH_SIZE];
+
+#define OCC_RESERVATION_LIFETIME  60u   // ticks (~6s @ sim 10)
+
 // Pure deterministic hash on coarse cell coordinates.
 // Defined inline so both writer (occupancy) and reader (heuristic) get
 // the SAME bit pattern without depending on translation-unit ordering.

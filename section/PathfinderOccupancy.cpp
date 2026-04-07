@@ -38,6 +38,14 @@
 // --------------------------------------------------------------------------
 uint32_t gPathOccupancyHash[OCC_HASH_SIZE] = {0};
 
+// Path reservation hash. Same shape as occupancy hash but the high 24 bits
+// store an EXPIRATION tick instead of the current tick — buckets stay
+// "live" until the expiration tick is reached.
+uint32_t gPathReservationHash[OCC_HASH_SIZE] = {0};
+
+// CAiPathFinder + 0x28 → Sim*. Local define so this file is independent.
+#define OFF_PF_SIM    0x28
+
 // Unit::GetPosition is a virtual method.  vftable slot is at byte offset
 // 0x14 = index 5 (per IDA disassembly of TaskTick around 0x5D3503).
 // __fastcall(this, dummy_edx) matches __thiscall ABI for a 1-arg member.
@@ -125,6 +133,88 @@ extern "C" void __cdecl OnTickObserveC(void* ctask)
     }
     ++gOnTickCallCount;
 }
+
+// --------------------------------------------------------------------------
+// OnPathAccepted observer — called from asm thunk on entry to
+// CAiPathFinder::OnPathAccepted (0x5AA9A0).
+//
+// pathfinder = CAiPathFinder*  (this)
+// vec        = std::vector<HPathCell>* of cells in the accepted path
+//
+// Vector layout (verified from IDA disasm):
+//   [+4]  _Myfirst  (HPathCell* first)
+//   [+8]  _Mylast   (HPathCell* one past last)
+// Each HPathCell is 4 bytes (uint16 x, uint16 z).
+//
+// We iterate every cell, hash to a coarse bucket, and bump the
+// reservation hash with an expiration tick = curTick + LIFETIME.
+// --------------------------------------------------------------------------
+extern "C" void __cdecl OnPathAcceptedC(void* pathfinder, void* vec)
+{
+    if (!pathfinder || !vec) return;
+
+    uint32_t* myfirst = *reinterpret_cast<uint32_t**>(static_cast<uint8_t*>(vec) + 4);
+    uint32_t* mylast  = *reinterpret_cast<uint32_t**>(static_cast<uint8_t*>(vec) + 8);
+    if (!myfirst || mylast <= myfirst) return;
+
+    void* sim = *reinterpret_cast<void**>(static_cast<uint8_t*>(pathfinder) + OFF_PF_SIM);
+    if (!sim) return;
+    uint32_t curTick   = *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(sim) + OFF_SIM_CURTICK);
+    uint32_t expireTick = curTick + OCC_RESERVATION_LIFETIME;
+
+    // Walk every cell in the accepted path
+    for (uint32_t* p = myfirst; p < mylast; ++p) {
+        uint32_t packed = *p;
+        int cx = (int)(int16_t)(packed & 0xFFFFu);
+        int cz = (int)(int16_t)((packed >> 16) & 0xFFFFu);
+
+        int bcx = cx / OCC_BUCKET_SIZE;
+        int bcz = cz / OCC_BUCKET_SIZE;
+        uint32_t bucket = PathOcc_HashCell(bcx, bcz);
+
+        uint32_t cur   = gPathReservationHash[bucket];
+        uint32_t bExp  = cur >> 8;
+        uint32_t bCnt  = cur & 0xFFu;
+
+        if (bExp <= curTick) {
+            // Expired — start fresh
+            gPathReservationHash[bucket] = (expireTick << 8) | 1u;
+        } else if (bCnt < 255u) {
+            gPathReservationHash[bucket] = (expireTick << 8) | (bCnt + 1u);
+        }
+        // else saturated — keep as is
+    }
+}
+
+// --------------------------------------------------------------------------
+// Asm thunk — entry from JMP at 0x5AA9A0 (PathfinderOccupancy.hook).
+//
+// __thiscall: ecx = pathfinder, [esp+4] = vec*, ret 4
+//
+// Original 8-byte prolog being replaced (push esi / xor eax,eax / push edi
+// / mov edi,[esp+0Ch]). We pushad to save state, call the C handler with
+// (this, vec) cdecl args, popad, re-execute the 4 prolog instructions,
+// then jmp to 0x5AA9A8 (continue at `mov byte ptr [ecx+65h], 1`).
+// --------------------------------------------------------------------------
+asm(
+    ".global _OnPathAcceptedHook\n"
+    "_OnPathAcceptedHook:\n"
+
+    "    pushad\n"
+    "    push dword ptr [esp+36]\n"  // vec  (orig esp+4 + 32 from pushad)
+    "    push ecx\n"                  // pathfinder (this)
+    "    call _OnPathAcceptedC\n"
+    "    add esp, 8\n"
+    "    popad\n"
+
+    // Re-execute the original 8-byte prolog:
+    "    push esi\n"                  //   56
+    "    xor eax, eax\n"               //   33 c0
+    "    push edi\n"                  //   57
+    "    mov edi, [esp+0x0C]\n"       //   8b 7c 24 0c
+
+    "    jmp 0x005AA9A8\n"             // continue at mov [ecx+65h], 1
+);
 
 // --------------------------------------------------------------------------
 // Asm thunk — entry from JMP at 0x5D32B0.

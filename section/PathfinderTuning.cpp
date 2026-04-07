@@ -48,19 +48,33 @@
 // --------------------------------------------------------------------------
 float pathHeuristicWeight   = 1.10f;
 float pathHeuristicSpread   = 0.50f;
-// Cost added per OTHER moving unit in candidate cell's bucket. The cap
-// is the critical fix: without it, dense clusters (max observed 30+ units)
-// produced prohibitive per-cell costs that sent engineers on huge detours.
-// With cap=8 the worst case is bounded at (8-1)*p per cell, so even
-// dense crowds can't deflect units beyond reason.
+// Cost added per OTHER moving unit in candidate cell's bucket. Two
+// safety features keep the penalty well-behaved:
 //
-// At 0.25 with cap=8:
-//   crowd of 4 over 5 cells = 5 * 3 * 0.25 = 3.75   (direct wins vs 5-cell detour)
-//   crowd of 8 over 5 cells = 5 * 7 * 0.25 = 8.75   (mild detour preference)
-//   crowd of 30 (capped 8)  = 5 * 7 * 0.25 = 8.75   (same as 8 — bounded)
+//   1. Cap effective count at OCC_COUNT_CAP=8: dense clusters (max observed
+//      30+ in one bucket) would otherwise produce explosive costs.
+//
+//   2. Distance-fade in ComputeHeuristicC: penalty fades to zero in the
+//      last 10 cells before the goal so engineers can enter crowded build
+//      sites without being deflected.
+//
+// At 0.50 with cap=8 and fade over 10 cells:
+//   wall of 8 at goal_dist=20, 5 cells thick = 5 * 7 * 0.5 * 1.0  = 17.5
+//   vs 20-cell base + 10-cell detour                              = 30
+//   → direct still wins by 12.5 (penalty visible but not blocking)
+//
+//   wall of 8 at goal_dist=15, 5 cells thick = 5 * 7 * 0.5 * 1.0  = 17.5
+//   vs 15-cell base + 30-cell detour                              = 45
+//   → direct wins by 27.5 (long walls still take direct unless very dense)
+//
+//   engineer crowd at goal_dist=5 (fade=0.5)  = 5 * 7 * 0.5 * 0.5 = 8.75
+//   plus base 5 = 13.75  vs 5-cell detour = 10 → detour barely wins
+//
+//   engineer crowd at goal_dist=2 (fade=0.2)  = 2 * 7 * 0.5 * 0.2 = 1.4
+//   → engineers easily enter the destination cluster
 //
 // Tunable via SetPathOccupancyPenalty(p) at runtime.
-float pathOccupancyPenalty  = 0.25f;
+float pathOccupancyPenalty  = 0.50f;
 #define OCC_COUNT_CAP   8u
 
 int SetPathHeuristicWeight(lua_State* L)
@@ -219,15 +233,75 @@ extern "C" void __cdecl ComputeHeuristicC(void* pathfinder, void* cellPtr, float
             uint32_t v = gPathOccupancyHash[bucket];
             if ((v >> 8) == curTick) {
                 observedCount = v & 0xFFu;
-                // Subtract 1: the unit doing the search is itself in the
-                // bucket; we only want to penalize OTHERS being there.
                 // Cap the effective count so single mega-clusters don't
                 // produce prohibitively expensive crossings.
                 uint32_t effective = observedCount;
                 if (effective > OCC_COUNT_CAP) effective = OCC_COUNT_CAP;
                 if (effective > 1) {
-                    penaltyAdded = (float)(effective - 1) * pathOccupancyPenalty;
+                    // ---- Wall-detection (A) -------------------------
+                    // A "wall" looks like a single dense bucket whose
+                    // 4 cardinal neighbors are ALSO crowded — units form
+                    // a continuous obstruction. An isolated cluster has
+                    // mostly empty neighbors. We sample 4 cells out and
+                    // count how many are also crowded; 3+ → wall, double
+                    // the per-cell penalty so a real wall becomes
+                    // expensive enough that A* prefers a flank.
+                    uint32_t wallNeighbors = 0;
+                    {
+                        uint32_t nb, nv;
+                        nb = PathOcc_HashCell(bcx - 1, bcz);
+                        nv = gPathOccupancyHash[nb];
+                        if ((nv >> 8) == curTick && (nv & 0xFFu) > 1) ++wallNeighbors;
+
+                        nb = PathOcc_HashCell(bcx + 1, bcz);
+                        nv = gPathOccupancyHash[nb];
+                        if ((nv >> 8) == curTick && (nv & 0xFFu) > 1) ++wallNeighbors;
+
+                        nb = PathOcc_HashCell(bcx, bcz - 1);
+                        nv = gPathOccupancyHash[nb];
+                        if ((nv >> 8) == curTick && (nv & 0xFFu) > 1) ++wallNeighbors;
+
+                        nb = PathOcc_HashCell(bcx, bcz + 1);
+                        nv = gPathOccupancyHash[nb];
+                        if ((nv >> 8) == curTick && (nv & 0xFFu) > 1) ++wallNeighbors;
+                    }
+                    float wallMult = (wallNeighbors >= 3) ? 2.0f
+                                   : (wallNeighbors == 2) ? 1.4f
+                                   : 1.0f;
+
+                    // Distance-faded penalty: full strength far from goal,
+                    // fades to zero as we approach. This is critical for
+                    // engineers trying to reach a build site INSIDE a
+                    // crowd — the penalty must not block them entering
+                    // the destination cluster, only help routing on the
+                    // way there. `major` is the octile distance to the
+                    // goal rect (already computed above), measured in
+                    // cells. Fade to zero over 10 cells.
+                    float fade = major * (1.0f / 10.0f);
+                    if (fade > 1.0f) fade = 1.0f;
+                    // Subtract 1: exclude self-contribution to the bucket.
+                    penaltyAdded = (float)(effective - 1) * pathOccupancyPenalty * fade * wallMult;
                     result += penaltyAdded;
+                }
+            }
+
+            // ---- Reservation hash (Cooperative A*) ----------------------
+            // Add penalty for cells already reserved by other units' just-
+            // accepted paths. Same fade applies — reservations near the goal
+            // don't matter (engineers reaching same build site).
+            // Reservations are weighted at 0.6× direct occupancy because
+            // they describe FUTURE positions which may or may not happen.
+            uint32_t rv = gPathReservationHash[bucket];
+            uint32_t rExp = rv >> 8;
+            if (rExp > curTick) {
+                uint32_t rCnt = rv & 0xFFu;
+                if (rCnt > OCC_COUNT_CAP) rCnt = OCC_COUNT_CAP;
+                if (rCnt > 0) {
+                    float fade2 = major * (1.0f / 10.0f);
+                    if (fade2 > 1.0f) fade2 = 1.0f;
+                    float resPen = (float)rCnt * pathOccupancyPenalty * 0.6f * fade2;
+                    penaltyAdded += resPen;
+                    result      += resPen;
                 }
             }
         }
