@@ -23,9 +23,15 @@
 
 #include "moho.h"
 #include "global.h"
-#include "MovementConfig.h"
 #include "PathfinderOccupancy.h"
 #include <stdint.h>
+
+// CAiSteeringImpl_CTask + 0x1C → Unit*
+#define OFF_STEERING_UNIT  0x1C
+// Unit + 0x150 → Sim*
+#define OFF_UNIT_SIM       0x150
+// Sim + 0x900 → int mCurTick
+#define OFF_SIM_CURTICK    0x900
 
 // --------------------------------------------------------------------------
 // Spatial hash storage. Constants and hash function live in the header.
@@ -37,8 +43,8 @@ uint32_t gPathOccupancyHash[OCC_HASH_SIZE] = {0};
 // __fastcall(this, dummy_edx) matches __thiscall ABI for a 1-arg member.
 // We use the vftable call rather than a direct field read because the
 // Unit struct holds multiple position-like vectors (Pos1, Pos2, Pos3, …)
-// at non-trivial offsets and OFF_UNIT_POS=0x160 in MovementConfig.h is
-// stale. The vftable is the engine's authoritative source.
+// at non-trivial offsets and a literal "0x160" guess is unreliable.
+// The vftable is the engine's authoritative source.
 typedef float* (__fastcall* GetPositionFn)(void* unit, int dummyEdx);
 #define UNIT_GETPOS_VFTABLE_SLOT  5
 

@@ -29,7 +29,6 @@
 #include "magic_classes.h"
 #include "moho.h"
 #include "global.h"
-#include "MovementConfig.h"
 #include "PathfinderOccupancy.h"
 #include <stdint.h>
 
@@ -39,6 +38,9 @@
 #define OFF_PF_GOAL_X1  0x44
 #define OFF_PF_GOAL_Z1  0x48
 #define OFF_PF_SIM      0x28    // CAiPathFinder + 0x28 → Sim*
+
+// Sim offsets (verified from existing patches and IDA)
+#define OFF_SIM_CURTICK 0x900   // Sim + 0x900 → int mCurTick
 
 // --------------------------------------------------------------------------
 // Tunable globals. Defaults are chosen to be a clear improvement over
