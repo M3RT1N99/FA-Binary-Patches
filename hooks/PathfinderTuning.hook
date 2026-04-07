@@ -1,0 +1,13 @@
+// PathfinderTuning.hook
+// Full replacement of Moho::CAiPathFinder::GetHeuristicCost (0x5AA590).
+// Overwrites the 6-byte prolog (55 8B EC 83 E4 F8) with a JMP to our
+// reimplementation in section/PathfinderTuning.cpp. The replacement adds
+// a per-pathfinder hash penalty so units sharing a goal get slightly
+// different A* costs and naturally diverge instead of all converging on
+// the same cell.
+//
+// Note: this supersedes the earlier in-place fmul patch at 0x5AA634 — those
+// bytes are now unreachable but harmless.
+0x005AA590:
+    jmp @HeuristicReplaceHook
+    nop
