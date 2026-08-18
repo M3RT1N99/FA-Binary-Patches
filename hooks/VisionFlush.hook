@@ -1,0 +1,57 @@
+// Fix fog-of-war stencil overflow with 256+ overlapping vision circles.
+//
+// Background: func_ren_FogOfWar (0x0081C660) renders one z-fail volume per
+// vision circle with the CastVision technique (vision.fx), counting overlap
+// per pixel in the stencil buffer, then paints fog with the Vision technique
+// (frame.fx) wherever the count is 0. The count wraps mod 256 (8-bit
+// stencil, two-sided INCR/DECR), so wherever exactly 256 circles overlap a
+// pixel the count returns to 0 and a 33%-black "gray ring" of fog is painted
+// over visible terrain. 128 units on water are enough (vision + water
+// vision = 2 circles each).
+//
+// Fix (mirror of the RenderRingsFlush patch, PR #149): cap the batch size
+// at 127 and convert the accumulated counts to stencil bit 7 with a
+// fullscreen VisionMask pass between batches. Requires the paired shader
+// changes in the FAF fa repo: vision.fx CastVision counts in bits 0-6 only
+// (StencilWriteMask 0x7F) and skips pixels already marked with bit 7;
+// frame.fx gains the VisionMask technique (low bits != 0 -> replace 0x80).
+// The final Vision technique is unchanged: it fogs stencil == 0, and both
+// the 0x80 mark and a last batch's raw count (1..127) are nonzero, so no
+// flush is needed after the final batch -- with <= 127 circles (single
+// batch) the patched loop does no extra work at all.
+//
+// The engine sets the stream-0 instancing frequency (= instance count) once
+// before the loop with the TOTAL circle count. With capped batches every
+// draw would then read past the current batch's instance data, so the
+// frequency must track the batch size: the first batch via the clamp hook
+// below, later batches re-issued per batch by the flush stub.
+
+// Batch cap: cmp eax, 0x3000  ->  cmp eax, 127
+// (imm32 of the 5-byte 'cmp eax, imm32' at 0x0081C9DF)
+0x0081C9E0:
+    .int 127
+
+// Batch ceiling: mov eax, 0x3000  ->  mov eax, 127
+// (imm32 of the 5-byte 'mov eax, imm32' at 0x0081C9E6)
+0x0081C9E7:
+    .int 127
+
+// Clamp the initial stream-0 frequency to the first batch size.
+// Replaces 'push 0; push edi; sub esp,8; mov ecx,esp' (8 bytes); the stub
+// reproduces them with edi = min(total, 127) and resumes at 0x0081C967.
+// edi is only read again inside the loop after being reloaded from the
+// total-count stack slot, so clamping the register is safe.
+0x0081C95F:
+    jmp @asm__VisionVB0Clamp
+    nop;nop;nop
+
+// Per-batch flush at the bottom of the batch loop.
+// Replaces 'mov eax,[esp+0x18]; add eax,[esp+0x20]' (8 bytes); the stub
+// reproduces the whole loop tail, and on loop-back runs the VisionMask
+// flush, restores the vertex declaration and index buffer clobbered by
+// CRenFrame::Render, and re-issues the stream-0 frequency for the next
+// batch. On loop exit it jumps straight to the engine's final Vision pass
+// at 0x0081CB23 (original bytes 0x81CB15..0x81CB23 become dead code).
+0x0081CB0D:
+    jmp @asm__VisionFlushTail
+    nop;nop;nop

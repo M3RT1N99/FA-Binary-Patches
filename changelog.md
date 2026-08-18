@@ -70,6 +70,11 @@ These don't matter except for other assembly patches
 
 ## Bugs
 
+- Fix fog-of-war stencil overflow with 256+ overlapping vision circles (gray fog ring painted over visible terrain around large unit stacks; 128 units on water suffice). Vision volumes are now counted in batches of at most 127 with an intermediate VisionMask fullscreen pass converting counts to a stencil mark bit, and the stream-0 instancing frequency is tracked per batch (also fixing a latent engine bug above 12288 circles). Requires the paired CastVision/VisionMask shader changes in the fa repo; with 127 or fewer circles the patched path does no extra work.
+
+  - hooks/VisionFlush.hook
+  - section/VisionFlush.cpp
+
 - Remove lingering transport load factor calcuation at aircraft initialization
 
   - hooks/RemoveTransportLoadFactor.cpp

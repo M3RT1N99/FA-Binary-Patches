@@ -121,7 +121,11 @@ LuaObjectFinalize
 0053E720 GetSimRate
 0053E7E0 GetSimRateRequested
 007EF9B0 DrawRings
-0081C660 DrawVision
+0081C660 DrawVision (func_ren_FogOfWar)
+0081CCB0 VisionInstanceVBAlloc (ring sub-allocator on the 12288-entry instance VB) retn 4
+007F5DA0 CRenFrame::InitTransformedVerts(this@ebx, float width, float height) retn 8
+007F6030 CRenFrame::Render(this@edi, int width, int height) retn 8
+004059E0 std::string::string(this@ecx, char const* s, size_t n) retn 8
 008F3C40 D3DXEffect::GetPassCount ?
 008F4080 D3DXEffect::BeginPass ?
 008F4260 D3DXEffect::EndPass ?
